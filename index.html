@@ -56,6 +56,10 @@
         background: #1f2937;
         border-color: #334155;
       }
+      button:disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
+      }
       .row {
         display: grid;
         gap: 10px;
@@ -71,6 +75,24 @@
       .muted {
         color: #94a3b8;
         font-size: 0.92rem;
+      }
+      .loading-inline {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .spinner {
+        width: 14px;
+        height: 14px;
+        border-radius: 999px;
+        border: 2px solid #334155;
+        border-top-color: #60a5fa;
+        animation: spin 0.8s linear infinite;
+      }
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
       }
       pre {
         white-space: pre-wrap;
@@ -194,6 +216,7 @@
         border-radius: 10px;
         padding: 10px;
         min-height: 180px;
+        max-height: 420px;
         overflow: auto;
       }
       .trace-line {

@@ -16,15 +16,74 @@ const DEFAULT_PAC = `function FindProxyForURL(url, host) {
 
 const app = document.getElementById("app");
 
+const CORS_PROXY_ENDPOINTS = [
+  {
+    name: "allorigins",
+    buildUrl: (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+  },
+  {
+    name: "isomorphic-git",
+    buildUrl: (url) => `https://cors.isomorphic-git.org/${url}`,
+  },
+];
+
 const state = {
   pacSource: DEFAULT_PAC,
   pacUrl: "",
   testUrl: "https://www.example.com",
   result: "",
+  loadInfo: "",
+  isLoadingPac: false,
   error: "",
   analysis: null,
   trace: [],
 };
+
+async function loadPacSourceFromUrl(rawUrl) {
+  const pacUrl = String(rawUrl || "").trim();
+  if (!pacUrl) {
+    throw new Error("Enter a PAC URL first.");
+  }
+
+  let normalizedUrl;
+  try {
+    normalizedUrl = new URL(pacUrl).toString();
+  } catch {
+    throw new Error("PAC URL is not valid.");
+  }
+
+  let directError;
+  try {
+    const response = await fetch(normalizedUrl);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+    return {
+      source: await response.text(),
+      loadedVia: "direct",
+    };
+  } catch (error) {
+    directError = error;
+  }
+
+  for (const endpoint of CORS_PROXY_ENDPOINTS) {
+    try {
+      const response = await fetch(endpoint.buildUrl(normalizedUrl));
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status} ${response.statusText}`);
+      }
+      return {
+        source: await response.text(),
+        loadedVia: `proxy (${endpoint.name})`,
+      };
+    } catch {
+      // Keep trying next proxy endpoint.
+    }
+  }
+
+  const reason = directError && directError.message ? directError.message : "Request blocked";
+  throw new Error(`Unable to load PAC URL. Direct request failed (${reason}) and proxy retries also failed.`);
+}
 
 function escapeHtml(value) {
   return String(value)
@@ -187,13 +246,20 @@ function extractFindProxyForURL(source) {
   };
 }
 
-function parseStatements(source, start = 0, stop = source.length, ctx = { ifCount: 0 }) {
+function parseStatements(source, start = 0, stop = source.length, ctx = { ifCount: 0, forCount: 0 }) {
   const statements = [];
   let i = start;
 
   while (i < stop) {
     i = skipWhitespaceAndComments(source, i);
     if (i >= stop) break;
+
+    if (source.startsWith("for", i) && !/[A-Za-z0-9_$]/.test(source[i + 3] || "")) {
+      const parsedFor = parseForStatement(source, i, ctx);
+      statements.push(parsedFor.node);
+      i = parsedFor.end;
+      continue;
+    }
 
     if (source.startsWith("if", i) && !/[A-Za-z0-9_$]/.test(source[i + 2] || "")) {
       const parsedIf = parseIfStatement(source, i, ctx);
@@ -220,6 +286,13 @@ function parseStatements(source, start = 0, stop = source.length, ctx = { ifCoun
           expression,
           raw,
         });
+      } else if (/^var\b/.test(raw)) {
+        const declaration = raw.replace(/^var\s+/, "").replace(/;\s*$/, "").trim();
+        statements.push({
+          type: "var",
+          declaration,
+          raw,
+        });
       } else {
         statements.push({
           type: "statement",
@@ -233,6 +306,33 @@ function parseStatements(source, start = 0, stop = source.length, ctx = { ifCoun
   }
 
   return statements;
+}
+
+function parseForStatement(source, start, ctx) {
+  let i = start + 3;
+  i = skipWhitespaceAndComments(source, i);
+  if (source[i] !== "(") {
+    throw new Error("Malformed for statement: missing loop header.");
+  }
+
+  const header = readBalanced(source, i, "(", ")");
+  i = skipWhitespaceAndComments(source, header.end);
+  if (source[i] !== "{") {
+    throw new Error("Malformed for statement: expected block body.");
+  }
+
+  const bodyBlock = readBalanced(source, i, "{", "}");
+  const bodyStatements = parseStatements(bodyBlock.content, 0, bodyBlock.content.length, ctx);
+  i = bodyBlock.end;
+
+  const node = {
+    type: "for",
+    id: `for_${++ctx.forCount}`,
+    header: header.content.trim(),
+    body: bodyStatements,
+  };
+
+  return { node, end: i };
 }
 
 function parseIfStatement(source, start, ctx) {
@@ -281,6 +381,14 @@ function parseIfStatement(source, start, ctx) {
 }
 
 function createRuntime() {
+  function ipToInt(ip) {
+    const parts = String(ip).trim().split(".").map((part) => Number(part));
+    if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+      throw new Error(`Invalid IPv4 address: ${ip}`);
+    }
+    return (((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
+  }
+
   return {
     dnsDomainIs(host, domain) {
       return host.endsWith(domain);
@@ -294,6 +402,17 @@ function createRuntime() {
     },
     isPlainHostName(host) {
       return !host.includes(".");
+    },
+    isInNet(host, pattern, mask) {
+      try {
+        const hostIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ? host : this.dnsResolve(host);
+        const hostInt = ipToInt(hostIp);
+        const patternInt = ipToInt(pattern);
+        const maskInt = ipToInt(mask);
+        return (hostInt & maskInt) === (patternInt & maskInt);
+      } catch {
+        return false;
+      }
     },
     dnsResolve() {
       return "127.0.0.1";
@@ -322,8 +441,198 @@ function evaluateExpression(expression, context) {
   return fn(...Object.values(context));
 }
 
+const MAX_TRACE_LOOP_ITERATIONS = 2000;
+
+function splitTopLevel(source, delimiter) {
+  const parts = [];
+  let quote = "";
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let last = 0;
+
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (quote) {
+      if (ch === "\\") {
+        i += 1;
+        continue;
+      }
+      if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(") parenDepth += 1;
+    else if (ch === ")") parenDepth -= 1;
+    else if (ch === "[") bracketDepth += 1;
+    else if (ch === "]") bracketDepth -= 1;
+    else if (ch === "{") braceDepth += 1;
+    else if (ch === "}") braceDepth -= 1;
+
+    if (ch === delimiter && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0) {
+      parts.push(source.slice(last, i).trim());
+      last = i + 1;
+    }
+  }
+
+  parts.push(source.slice(last).trim());
+  return parts;
+}
+
+function applyVarDeclaration(declaration, context) {
+  const entries = splitTopLevel(declaration, ",");
+  for (const entry of entries) {
+    if (!entry) continue;
+    const eqIndex = entry.indexOf("=");
+    if (eqIndex < 0) {
+      const varName = entry.trim();
+      if (varName) context[varName] = undefined;
+      continue;
+    }
+    const varName = entry.slice(0, eqIndex).trim();
+    const rhs = entry.slice(eqIndex + 1).trim();
+    if (!varName) continue;
+    context[varName] = rhs ? evaluateExpression(rhs, context) : undefined;
+  }
+}
+
+function executeStatement(raw, context) {
+  const fn = new Function("ctx", `with (ctx) { ${raw} }`);
+  fn(context);
+}
+
+function parseForHeader(header) {
+  const parts = splitTopLevel(header, ";");
+  if (parts.length !== 3) {
+    throw new Error(`Unsupported for-loop header: ${header}`);
+  }
+  return {
+    init: parts[0],
+    condition: parts[1],
+    update: parts[2],
+  };
+}
+
+function executeForSegment(segment, context) {
+  const text = String(segment || "").trim();
+  if (!text) return;
+  if (/^var\b/.test(text)) {
+    applyVarDeclaration(text.replace(/^var\s+/, "").trim(), context);
+    return;
+  }
+  executeStatement(text, context);
+}
+
 function traceExecution(statements, context, trace, depth = 0) {
   for (const node of statements) {
+    if (node.type === "var") {
+      applyVarDeclaration(node.declaration, context);
+      continue;
+    }
+
+    if (node.type === "statement") {
+      try {
+        executeStatement(node.raw, context);
+      } catch {
+        // Best-effort trace execution for non-control statements.
+      }
+      continue;
+    }
+
+    if (node.type === "for") {
+      let header;
+      try {
+        header = parseForHeader(node.header);
+      } catch (error) {
+        trace.push({
+          type: "if-error",
+          id: node.id,
+          depth,
+          condition: `for (${node.header})`,
+          error: error.message,
+        });
+        throw error;
+      }
+
+      trace.push({
+        type: "for",
+        id: node.id,
+        depth,
+        header: node.header,
+      });
+
+      try {
+        executeForSegment(header.init, context);
+      } catch (error) {
+        trace.push({
+          type: "if-error",
+          id: node.id,
+          depth,
+          condition: `for-init (${header.init})`,
+          error: error.message,
+        });
+        throw error;
+      }
+
+      let iteration = 0;
+      while (true) {
+        let decision = true;
+        try {
+          decision = header.condition ? Boolean(evaluateExpression(header.condition, context)) : true;
+        } catch (error) {
+          trace.push({
+            type: "if-error",
+            id: node.id,
+            depth,
+            condition: `for-cond (${header.condition})`,
+            error: error.message,
+          });
+          throw error;
+        }
+
+        trace.push({
+          type: "for-check",
+          id: node.id,
+          depth,
+          condition: header.condition || "(true)",
+          decision,
+          iteration,
+        });
+
+        if (!decision) break;
+        if (iteration >= MAX_TRACE_LOOP_ITERATIONS) {
+          trace.push({
+            type: "trace-note",
+            id: node.id,
+            depth,
+            message: `Trace truncated at ${MAX_TRACE_LOOP_ITERATIONS} iterations for ${node.id}.`,
+          });
+          break;
+        }
+
+        const nested = traceExecution(node.body, context, trace, depth + 1);
+        if (nested.returned) return nested;
+
+        try {
+          executeForSegment(header.update, context);
+        } catch (error) {
+          trace.push({
+            type: "if-error",
+            id: node.id,
+            depth,
+            condition: `for-update (${header.update})`,
+            error: error.message,
+          });
+          throw error;
+        }
+        iteration += 1;
+      }
+      continue;
+    }
+
     if (node.type === "if") {
       let decision = false;
       try {
@@ -385,6 +694,8 @@ function collectIfInsights(statements) {
     for (const node of nodes) {
       if (node.type === "return") {
         out.push(node.expression);
+      } else if (node.type === "for") {
+        collectReturns(node.body, out);
       } else if (node.type === "if") {
         collectReturns(node.then, out);
         collectReturns(node.else, out);
@@ -394,6 +705,10 @@ function collectIfInsights(statements) {
 
   function walk(nodes, depth) {
     for (const node of nodes) {
+      if (node.type === "for") {
+        walk(node.body, depth + 1);
+        continue;
+      }
       if (node.type !== "if") continue;
       const thenReturns = [];
       const elseReturns = [];
@@ -423,6 +738,9 @@ function collectReturnExpressions(statements, out = []) {
     if (node.type === "return") {
       out.push(node.expression);
     }
+    if (node.type === "for") {
+      collectReturnExpressions(node.body, out);
+    }
     if (node.type === "if") {
       collectReturnExpressions(node.then, out);
       collectReturnExpressions(node.else, out);
@@ -431,11 +749,51 @@ function collectReturnExpressions(statements, out = []) {
   return out;
 }
 
+function countNodeType(statements, targetType) {
+  let count = 0;
+  function walk(nodes) {
+    for (const node of nodes) {
+      if (node.type === targetType) count += 1;
+      if (node.type === "if") {
+        walk(node.then);
+        walk(node.else);
+      } else if (node.type === "for") {
+        walk(node.body);
+      }
+    }
+  }
+  walk(statements);
+  return count;
+}
+
 function renderFlowNodes(nodes, depth = 0) {
   if (!nodes.length) {
     return `<div class="flow-empty" style="margin-left:${depth * 16}px;">(no statements)</div>`;
   }
   return nodes.map((node) => {
+    if (node.type === "var") {
+      return `
+        <div class="flow-node" style="margin-left:${depth * 16}px;">
+          <div class="flow-kind">var</div>
+          <div class="flow-text">${escapeHtml(compactText(node.declaration, 120))}</div>
+        </div>
+      `;
+    }
+    if (node.type === "for") {
+      return `
+        <div class="flow-node" style="margin-left:${depth * 16}px;">
+          <div class="flow-kind">for</div>
+          <div class="flow-text"><code>${escapeHtml(compactText(node.header, 120))}</code></div>
+          <div class="flow-branch">
+            <div class="flow-branch-label ok">loop body</div>
+            ${renderFlowNodes(node.body, depth + 1)}
+          </div>
+          <div class="flow-branch">
+            <div class="flow-branch-label muted">after loop</div>
+          </div>
+        </div>
+      `;
+    }
     if (node.type === "if") {
       return `
         <div class="flow-node" style="margin-left:${depth * 16}px;">
@@ -483,6 +841,7 @@ function analyzePac(source) {
   const statements = parseStatements(fn.body);
   const ifRows = collectIfInsights(statements);
   const returnExpressions = collectReturnExpressions(statements);
+  const loopCount = countNodeType(statements, "for");
   const maxDepth = ifRows.reduce((max, row) => Math.max(max, row.depth), 0);
   const helperUsage = {};
 
@@ -497,6 +856,7 @@ function analyzePac(source) {
     statements,
     ifRows,
     returnExpressions,
+    loopCount,
     maxDepth,
     helperUsage,
     flowHtml: buildFlowSummary(statements),
@@ -550,11 +910,20 @@ function renderTrace(trace) {
 
   return trace.map((step) => {
     const indent = "&nbsp;".repeat(step.depth * 4);
+    if (step.type === "for") {
+      return `<div class="trace-line">${indent}<strong>${escapeHtml(step.id)}</strong> for (<code>${escapeHtml(step.header)}</code>)</div>`;
+    }
+    if (step.type === "for-check") {
+      return `<div class="trace-line">${indent}<strong>${escapeHtml(step.id)}</strong> condition [iter ${step.iteration}] ${escapeHtml(step.condition)} => <span class="${step.decision ? "ok" : "muted"}">${step.decision}</span></div>`;
+    }
     if (step.type === "if") {
       return `<div class="trace-line">${indent}<strong>${escapeHtml(step.id)}</strong> ${escapeHtml(step.condition)} => <span class="${step.decision ? "ok" : "muted"}">${step.decision}</span></div>`;
     }
     if (step.type === "return") {
       return `<div class="trace-line">${indent}<strong>return</strong> ${escapeHtml(step.expression)} => <span class="ok">${escapeHtml(step.value)}</span></div>`;
+    }
+    if (step.type === "trace-note") {
+      return `<div class="trace-line muted">${indent}${escapeHtml(step.message || "Trace note")}</div>`;
     }
     return `<div class="trace-line error">${indent}${escapeHtml(step.error || "Trace error")}</div>`;
   }).join("\n");
@@ -566,7 +935,7 @@ function render() {
 
   app.innerHTML = `
     <h1>PAC Validator</h1>
-    <p class="muted">Analyze every <code>if</code> block in <code>FindProxyForURL</code>, inspect branch outcomes, and see a visual decision graph plus runtime trace.</p>
+    <p class="muted">Analyze control flow in <code>FindProxyForURL</code>, inspect branch outcomes, and see a visual decision graph plus runtime trace.</p>
 
     <div class="grid">
       <div class="card spaced">
@@ -574,8 +943,9 @@ function render() {
         <label for="pacUrl">PAC URL</label>
         <div class="actions">
           <input id="pacUrl" placeholder="https://example.com/proxy.pac" value="${escapeHtml(state.pacUrl)}" />
-          <button id="loadUrl">Load URL</button>
+          <button id="loadUrl" ${state.isLoadingPac ? "disabled" : ""}>${state.isLoadingPac ? "Loading..." : "Load URL"}</button>
         </div>
+        ${state.isLoadingPac ? `<div class="muted loading-inline"><span class="spinner" aria-hidden="true"></span>Fetching PAC from URL...</div>` : ""}
 
         <label for="pacSource">PAC Source</label>
         <textarea id="pacSource">${escapeHtml(state.pacSource)}</textarea>
@@ -594,6 +964,7 @@ function render() {
           <h3>Result</h3>
           <pre id="result">${escapeHtml(state.result || "Run analysis or evaluation to see output.")}</pre>
         </div>
+        ${state.loadInfo ? `<div class="muted">${escapeHtml(state.loadInfo)}</div>` : ""}
         ${state.error ? `<div class="error"><strong>Error:</strong> ${escapeHtml(state.error)}</div>` : ""}
       </div>
     </div>
@@ -602,11 +973,12 @@ function render() {
       <div class="card spaced">
         <h2>Insights</h2>
         ${analysis ? `
-          <div class="insight-cards">
-            <div><span class="muted">If blocks</span><strong>${analysis.ifRows.length}</strong></div>
-            <div><span class="muted">Max depth</span><strong>${analysis.maxDepth || 0}</strong></div>
-            <div><span class="muted">Return paths</span><strong>${analysis.returnExpressions.length}</strong></div>
-          </div>
+            <div class="insight-cards">
+              <div><span class="muted">If blocks</span><strong>${analysis.ifRows.length}</strong></div>
+              <div><span class="muted">For loops</span><strong>${analysis.loopCount}</strong></div>
+              <div><span class="muted">Max depth</span><strong>${analysis.maxDepth || 0}</strong></div>
+              <div><span class="muted">Return paths</span><strong>${analysis.returnExpressions.length}</strong></div>
+            </div>
           <div class="muted">Helpers used: ${helperStats.length ? helperStats.map(([name, count]) => `${escapeHtml(name)}(${count})`).join(", ") : "none"}</div>
           ${renderIfRows(analysis.ifRows)}
         ` : `<div class="muted">Run <strong>Analyze PAC</strong> to see branch-level insights.</div>`}
@@ -618,9 +990,9 @@ function render() {
       </div>
     </div>
 
-    <div class="card spaced" style="margin-top:16px;">
-      <h2>Visualization</h2>
-      <p class="muted">Control flow of <code>FindProxyForURL</code> including nested <code>if / else</code> branches.</p>
+      <div class="card spaced" style="margin-top:16px;">
+        <h2>Visualization</h2>
+      <p class="muted">Control flow of <code>FindProxyForURL</code> including nested <code>if / else</code> and <code>for</code> blocks.</p>
       <div id="graph">${analysis ? analysis.flowHtml : `<div class="muted">Run analysis to generate the control-flow graph.</div>`}</div>
     </div>
   `;
@@ -639,6 +1011,8 @@ function render() {
     state.pacSource = DEFAULT_PAC;
     state.error = "";
     state.result = "";
+    state.loadInfo = "";
+    state.isLoadingPac = false;
     state.pacUrl = "";
     state.analysis = null;
     state.trace = [];
@@ -646,18 +1020,21 @@ function render() {
   });
 
   document.getElementById("loadUrl").addEventListener("click", async () => {
+    if (state.isLoadingPac) return;
     try {
       state.error = "";
-      const response = await fetch(state.pacUrl);
-      if (!response.ok) {
-        throw new Error(`Failed to load PAC: ${response.status} ${response.statusText}`);
-      }
-      state.pacSource = await response.text();
+      state.isLoadingPac = true;
+      render();
+      const loaded = await loadPacSourceFromUrl(state.pacUrl);
+      state.pacSource = loaded.source;
+      state.loadInfo = `Loaded PAC from URL via ${loaded.loadedVia}.`;
       state.analysis = null;
       state.trace = [];
-      render();
     } catch (error) {
+      state.loadInfo = "";
       state.error = error.message;
+    } finally {
+      state.isLoadingPac = false;
       render();
     }
   });
